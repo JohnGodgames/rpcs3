@@ -339,8 +339,8 @@ namespace rsx
 
 		std::unordered_map<u32, framebuffer_memory_characteristics> m_cache_miss_statistics_table;
 
-		//Set when a hw blit engine incompatibility is detected
-		bool blit_engine_incompatibility_warning_raised = false;
+		//Map of messages to only emit once
+		std::unordered_map<std::string, bool> m_once_only_messages_map;
 
 		//Set when a shader read-only texture data suddenly becomes contested, usually by fbo memory
 		bool read_only_tex_invalidate = false;
@@ -357,6 +357,7 @@ namespace rsx
 		//Other statistics
 		std::atomic<u32> m_num_flush_requests = { 0 };
 		std::atomic<u32> m_num_cache_misses = { 0 };
+		std::atomic<u32> m_num_cache_mispredictions = { 0 };
 
 		/* Helpers */
 		virtual void free_texture_section(section_storage_type&) = 0;
@@ -378,6 +379,33 @@ namespace rsx
 		inline void update_cache_tag()
 		{
 			m_cache_update_tag++;
+		}
+
+		template <typename ...Args>
+		void emit_once(bool error, const char* fmt, Args&&... params)
+		{
+			const std::string message = fmt::format(fmt, std::forward<Args>(params)...);
+			if (m_once_only_messages_map.find(message) != m_once_only_messages_map.end())
+				return;
+
+			if (error)
+				logs::RSX.error(message.c_str());
+			else
+				logs::RSX.warning(message.c_str());
+
+			m_once_only_messages_map[message] = true;
+		}
+
+		template <typename ...Args>
+		void err_once(const char* fmt, Args&&... params)
+		{
+			emit_once(true, fmt, std::forward<Args>(params)...);
+		}
+
+		template <typename ...Args>
+		void warn_once(const char* fmt, Args&&... params)
+		{
+			emit_once(false, fmt, std::forward<Args>(params)...);
 		}
 
 	private:
@@ -1569,7 +1597,7 @@ namespace rsx
 					}
 				}
 
-				if ((!blit_engine_incompatibility_warning_raised && g_cfg.video.use_gpu_texture_scaling) || is_hw_blit_engine_compatible(format))
+				if (is_hw_blit_engine_compatible(format))
 				{
 					//Find based on range instead
 					auto overlapping_surfaces = find_texture_from_range(texaddr, tex_size);
@@ -1597,14 +1625,6 @@ namespace rsx
 										extended_dimension != rsx::texture_dimension_extended::texture_dimension_1d)
 									{
 										LOG_ERROR(RSX, "Texture resides in blit engine memory, but requested type is not 2D (%d)", (u32)extended_dimension);
-										break;
-									}
-
-									if (!blit_engine_incompatibility_warning_raised && !is_hw_blit_engine_compatible(format))
-									{
-										LOG_ERROR(RSX, "Format 0x%X is not compatible with the hardware blit acceleration."
-											" Consider turning off GPU texture scaling in the options to partially handle textures on your CPU.", format);
-										blit_engine_incompatibility_warning_raised = true;
 										break;
 									}
 
@@ -2000,6 +2020,11 @@ namespace rsx
 					cached_dest->reprotect(utils::protection::no);
 					m_cache[get_block_address(cached_dest->get_section_base())].notify();
 				}
+				else if (cached_dest->is_synchronized())
+				{
+					//Prematurely read back
+					m_num_cache_mispredictions++;
+				}
 
 				cached_dest->touch();
 			}
@@ -2059,6 +2084,7 @@ namespace rsx
 		{
 			m_num_flush_requests.store(0u);
 			m_num_cache_misses.store(0u);
+			m_num_cache_mispredictions.store(0u);
 		}
 
 		virtual const u32 get_unreleased_textures_count() const
@@ -2074,6 +2100,11 @@ namespace rsx
 		virtual u32 get_num_flush_requests() const
 		{
 			return m_num_flush_requests;
+		}
+
+		virtual u32 get_num_cache_mispredictions() const
+		{
+			return m_num_cache_mispredictions;
 		}
 
 		virtual f32 get_cache_miss_ratio() const
